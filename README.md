@@ -4,7 +4,7 @@ The following files were submitted for the second project of John Hopkins Univer
 ### Submission by Connor Lenio. Email: cojamalo@gmail.com
 Completion Date: Apr 3, 2017
 
-### Please view https://cojamalo.github.io/DATA-JHU-Reproducible-Research-1/PA1_template.html to properly view the completed html document.
+### Please view https://cojamalo.github.io/DATA-JHU-Reproducible-Research-2/project2.html or  http://rpubs.com/cojamalo/265021 to properly view the completed html document.
 
 ## From the Project's Instructions:
 ### Introduction
