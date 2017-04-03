@@ -1,0 +1,520 @@
+---
+title: "The Most Harmful Weather Events for US Public Health and the Economy from 1950-2011"
+output: 
+    html_document:
+    keep_md: yes
+    variant: markdown_github
+---
+
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,fig.align='center')
+```
+### Submission by Connor Lenio. Email: cojamalo@gmail.com
+Completion Date: Apr 3, 2017
+
+### Synopsis
+The U.S. National Oceanic and Atmospheric Administration's (NOAA) tracks major storms and weather events across the United States in its storm database. The database contains a wealth of information about weather events that is useful for analyzing the properties and consequences of these events. Two important impacts of weather events are their threat to public health as well as their effect on the economy. In the storm database, NOAA specifically records information on injuries and fatalities, and property and crop damage to help interested parties address these issues. In this analysis, the data is loaded and processed, translating the relevant variables into more useful data types and formats. Considering the unique event types present for each observation in the data, the analysis proceeds by summarizing the data using cumulative totals for the number of injuries and fatalities caused by each event type to determine which weather events are most harmful to public health. A similar summary is produced for the data using the cumulative amounts of property and crop damage in inflation-adjusted 2011 dollars to find those weather events that have the greatest impact on the economy. Alternative statistics for frequency-adjusted amounts of these variables are also considered to take a different perspective on these concerns.
+
+### Data Processing
+
+#### Load necessary packages
+
+```{r load-packages, message = FALSE}
+library(R.utils)
+library(data.table)
+library(lubridate)
+library(quantmod)
+library(xts)
+library(gridExtra)
+library(colorspace)
+library(pander)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+```
+<br>
+
+#### Load data
+
+The data source is downloaded to the local directory, then is uncompressed to the CSV file type. Finally, the data is loaded into the current session using fread and is converted to a tibble for use with dplyr - `all_data`:
+```{r load-data, message=FALSE, warning=FALSE, cache=TRUE}
+# Data used in this project was downloaded on 04-03-2017 
+bz2_source_url <- "https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2"
+bz2_dest_path <- "repdata-data-StormData.csv.bz2"
+
+#Check if the compressed file is already in working directory before downloading
+if (!file.exists(bz2_dest_path)) {
+    download.file("https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2", destfile = bz2_dest_path)
+}
+
+csv_dest_path <- "repdata-data-StormData.csv"
+
+#Check if the uncompressed file is already in working directory before uncompressing
+if(!file.exists(csv_dest_path)) {
+    bunzip2(bz2_dest_path, destname = csv_dest_path, remove = FALSE, skip = TRUE)  
+}
+
+all_data <- fread(csv_dest_path, na.strings = "", showProgress = FALSE) %>% tbl_df
+
+#Take a glimpse of the loaded data
+glimpse(all_data)
+```
+<br>
+
+#### Prepare the data for analysis
+The following pre-processing steps prepare the data for analysis.
+
+<br>
+
+**Select the relevant variables, set variable types, and convert NAs in `propdmg` and `cropdmg` to zero**
+
+The result of this step is the data frame, `dat1`:
+```{r cleaning}
+#Make all variable names lower case for style
+names(all_data) <- tolower(names(all_data))
+
+#Select only the relevant variables for this analysis
+dat1 <- all_data %>% select(bgn_date, state, evtype, fatalities, injuries, propdmg, propdmgexp, cropdmg, cropdmgexp, remarks)
+
+#Correct the default variable types 
+dat1$bgn_date <- mdy_hms(dat1$bgn_date)
+dat1$state <- factor(dat1$state)
+dat1$evtype <- factor(dat1$evtype)
+
+#Set all propdmg and cropdmg values to zero if they are NAs
+dat1$propdmg[is.na(dat1$propdmg)] <- 0
+dat1$cropdmg[is.na(dat1$cropdmg)] <- 0
+
+#Take a glimpse of the processed data so far
+glimpse(dat1)
+```
+<br>
+
+**Add variable for combined injury and fatality count**
+
+The result of this step is the variable `both_injurys_deaths`:
+```{r mutate1}
+dat1 <- dat1 %>% 
+    mutate(both_injurys_deaths = fatalities + injuries)
+
+#Take a glimpse of the processed data so far
+glimpse(dat1)
+```
+
+<br>
+
+**Add variables to determine economic damages in logical units: dollars**
+
+First, a problem with the data is addressed. The NOAA used two separate variables to convey information about the economic damage of each weather event. One variable is the numeric part such as 115, and the second variable is a modifier indicating what tens place the numeric part refers to. For instance, 115 followed by an entry of "M" in the second column signifies $115,000,000.  This feature of the data makes it difficult to add different rows together as each numeric portion needs the modifier information to determine its true value. Thus, these two variables are translated to a single new variable to make it easier to compare damage values as one numeric value rather than a numeric and its modifier.
+
+Here is an example of the many modifiers present in the data for property damage:
+```{r print-modifiers}
+print(sort(unique(dat1$propdmgexp)))
+```
+
+
+The supplemental documentation for the data set comes from the following source: https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf. On page twelve of this documentation, only "K", "M", and "B" are mentioned with the values of "thousand", " million", and "billion" respectively. Expanding from these three options, the lower case versions, "k", "m", and "b", can be included as well. None of the other possible modifiers are mentioned and it is not clear what they might represent. Thus, the single numeric variable will only involve the clearly defined options. Only using these options covers the vast majority of non-zero values in the data, so no significant quantity of information is lost.
+
+Using the function `tidy_dmg`, the new variables `prop_dmg_dol` and `crop_dmg_dol` are derived with property damages for each row. Then, the variable `tot_dmg_dol` is derived from these two variables for each row. Finally, outlying values are corrected (See Appendix A, for the process that determined why to correct these values). The outcome data frame for these steps is, `dat2`: 
+```{r mutate2, cache=TRUE}
+#Set numeric print options to display nine digits to better work with large financial numbers
+options(scipen = 9)
+
+#This function will be applied to the problem variables
+tidy_dmg <- function(x) {
+    #Create two vectors of the same length to map the values to be translated
+    dmg_key <- c("k", "K", "m", "M", "b", "B")
+    dmg_val <- c(1000, 1000, 1e+06, 1e+06, 1e+09, 1e+09)
+    
+    #Check if the current value is in the character vector and, if it is, returns the proper value from the numeric vector, else return zero.
+    if (x %in% dmg_key) {
+        index <- which(dmg_key %in% x)
+         return(dmg_val[index])
+    }
+    return (0)
+}
+
+#Use mutate and sapply to create desired variables by multiplying the numeric values by the numeric values of their modifiers 
+dat1 <- dat1 %>% 
+    mutate(prop_dmg_dol = propdmg * sapply(dat1$propdmgexp, FUN = tidy_dmg), crop_dmg_dol = cropdmg * sapply(dat1$cropdmgexp, FUN = tidy_dmg)) %>%
+    mutate(tot_dmg_dol = prop_dmg_dol + crop_dmg_dol)
+
+#Correct outliers in the data based on side analysis in Appendix A
+dat2 <- dat1
+dat2$propdmgexp[dat2$propdmg == 115 & dat2$propdmgexp == "B"] <- "M"
+dat2$prop_dmg_dol[dat2$prop_dmg_dol == 115000000000] <- 115000000
+
+#Create the derived variable for the total economic damage
+dat2 <- dat2 %>%
+    mutate(tot_dmg_dol = prop_dmg_dol + crop_dmg_dol)
+
+#Take a glimpse of the processed data so far
+glimpse(dat2)
+```
+
+<br>
+
+**Adjust all the observations to account for changes in inflation**
+
+A dollar in 1950 is not the same as a dollar in 2011. Thus, to compare damage amounts, one should adjust for inflation.
+```{r inflation-adjust, message=FALSE, warning=FALSE}
+#Using quantmod, download the latest CPI data from FRED - Accessed 04-03-2017
+getSymbols("CPIAUCSL", src='FRED') #Consumer Price Index for All Urban Consumers: All Items
+
+#Using xts, determine the average CPI value for each year
+avg.cpi <- apply.yearly(CPIAUCSL, mean)
+
+#Adjust all the CPI values for the year 2011
+cf <- avg.cpi/as.numeric(avg.cpi['2011']) 
+
+#Convert to a data frame and mutate to make an adjusted cpi value for each year
+cf <- data.frame(date=index(cf), coredata(cf)) 
+cf <- cf %>%
+    mutate(year = format(date, "%Y")) %>%
+    select(year, CPIAUCSL)
+
+#Also give dat2 a variable with the year for each observation and join to cf with this new column
+#Convert all of the dollar value variables to their 2011 inflation-adjusted amounts
+dat2 <- dat2 %>% 
+    mutate(year = format(bgn_date, "%Y")) %>%
+    left_join(cf) %>%
+    mutate(prop_dmg_dol = round(prop_dmg_dol / CPIAUCSL, digits = 2), crop_dmg_dol = round(crop_dmg_dol / CPIAUCSL, digits = 2), tot_dmg_dol = round(tot_dmg_dol / CPIAUCSL, digits = 2))
+
+#Take a glimpse of the processed data 
+glimpse(dat2)
+```
+
+
+<br>
+
+**Creating a frequency table of the data by event type**
+
+It will be useful to keep track of all the possible event types present in the data as well as their percent portion of the total number of observations. The following code creates a variable, `event_dist`, which contains this table:
+
+```{r results="asis"}
+event_dist <- dat1 %>% 
+    group_by(evtype) %>% 
+    summarize(num_records = n()) %>% 
+    mutate(`%_tot_records` = round((num_records / 902297 * 100), digits = 1)) %>% 
+    arrange(desc(`%_tot_records`))
+pandoc.table(head(event_dist,10), justify = "right")
+```
+
+<br>
+
+At this point, all the necessary pre-processing steps are complete. The data frames, `dat1`, `dat2`, and `event_dist` are ready for use in the Results section.
+
+
+* * *
+### Results
+
+<br>
+
+#### Across the United States, which types of events are most harmful with respect to population?
+
+**Create a summarized table that addresses the question**
+
+The following code creates the data frame, `all_injuries_deaths`, which lists each event type by its cumulative total number of injuries, fatalities, and combined injuries and fatalities. To make the comparison easier, each category is given a numerical rank for each statistic. By default, the table is sorted by the total number of both injuries and deaths, but it can be sorted by any of the variables to quickly compare events.
+```{r message=FALSE, warning=FALSE, results="asis"}
+#Create a data frame with each event type by cumulative total injuries and fatalities, and give each event a rank
+total_injuries_deaths <- dat1 %>% 
+    group_by(evtype) %>% 
+    summarize(total_injuries_deaths = sum(both_injurys_deaths)) %>% 
+    arrange(desc(total_injuries_deaths)) %>% 
+    mutate(tot_rank = 1:985)
+
+#Create a data frame with each event type by cumulative injuries, and give each event a rank
+total_injuries <- dat1 %>% 
+    group_by(evtype) %>% 
+    summarize(total_injuries = sum(injuries)) %>% 
+    arrange(desc(total_injuries)) %>% 
+    mutate(inj_rank = 1:985)
+
+#Create a data frame with each event type by cumulative fatalities, and give each event a rank
+total_fatalities <- dat1 %>% 
+    group_by(evtype) %>% 
+    summarize(total_fatalities = sum(fatalities)) %>% 
+    arrange(desc(total_fatalities)) %>% 
+    mutate(death_rank = 1:985)
+
+#Join all three of the data frames together by event type to create the desired table
+all_injuries_deaths <- event_dist %>% 
+    left_join(total_injuries_deaths) %>% 
+    left_join(total_injuries) %>% 
+    left_join(total_fatalities) %>%
+    arrange(tot_rank)
+
+pandoc.table(head(all_injuries_deaths,10), justify = "right")
+```
+
+
+From `all_injuries_deaths`, it is clear that tornados are the most harmful with respect to population. Tornados rank first in cumulative number of injuries, fatalities, and combined injuries and fatalities. Other events of note are excessive heat, which cause the second highest number of fatalities, and thunderstorm winds, which cause the second highest number of inujuries.
+
+<br>
+
+**Create a plot that visualizes the data**
+
+The following code creates a three-panel plot that shows the top event types for each of the population harms:
+```{r fig.height = 8, fig.width=8, message=FALSE, warning=FALSE}
+#Create three different top ten lists for the three harms under consideration
+top1 <- all_injuries_deaths %>% top_n(n = 10, wt = total_injuries_deaths) %>% arrange(desc(total_injuries_deaths))
+top2 <- all_injuries_deaths %>% top_n(n = 10, wt = total_injuries) %>% arrange(desc(total_injuries))
+top3 <- all_injuries_deaths %>% top_n(n = 10, wt = total_fatalities) %>% arrange(desc(total_fatalities))
+
+#Create a fourth list that only lists the top nine events for total fatalities to ensure the first of the three plots is correct
+top4 <- all_injuries_deaths %>% top_n(n = 9, wt = total_fatalities) %>% arrange(desc(total_fatalities)) %>% filter(evtype != "RIP CURRENT")
+
+#Join the top ten lists together, substituting top4 for top3 to make sure the list is true to the actual top combined injuries and deaths list
+plot_dat <- top1 %>% full_join(top2) %>% full_join(top4) %>% gather(sum_type, count, total_injuries, total_fatalities)
+
+#Prepare a color palette for the plot using colorspace
+cc <- heat_hcl(2, h = c(0,-100), l = c(75,40), c = c(40,80), power = 1)
+
+#Plot the combined injuries and deaths data using ggplot
+total <- ggplot(plot_dat, aes(x = reorder(evtype, -count), y = count, fill = sum_type)) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = cc, labels = c("Fatalities","Injuries")) +
+    labs(title = "Cumulative Injuries and Fatalities by Most Harmful Weather Types",fill = "Harm Type", x="",y = "Total Number of Injuries and Deaths") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position = c(0.92, 0.8), plot.title = element_text(hjust = 0.5)) 
+
+#Plot the injuries only data using ggplot
+inj <- ggplot(top2, aes(x = reorder(evtype, -total_injuries), y = total_injuries, fill = "green")) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = rev(cc)) +
+    labs(title = "Top 10 Most Injurious Weather Types",x = "", y = "Cumulative Number of Injuries") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position='none', plot.title = element_text(size=10, hjust = 0.5)) 
+
+#Plot the fatalities only data using ggplot
+death <- ggplot(top3, aes(x = reorder(evtype, -total_fatalities), y = total_fatalities, fill = "pink")) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = cc) +
+    scale_y_continuous(breaks = c(0,1000,2000,3000,4000,5000)) +
+    labs(title = "Top 10 Most Fatal Weather Types",x="",y = "Cumulative Number of Deaths") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position='none',plot.title = element_text(size=10, hjust = 0.5))
+    
+#Use gridExtra to create a single panel plot of all three relevant plots for quick comparison
+grid.arrange(total, grid.arrange(inj,death,ncol=2), ncol = 1)
+```
+
+The plots visualize the relevant data for this question. The use of bar plots also allows one to see the magnitude of the differences between the cumulative totals for each harm type. Again, it is clear that tornadoes have caused the greatest amount of population harm over the years recorded in the data set. The visualization also shows how far more people are injured by weather events than are killed. Many events cause more injuries than fatalities. However, some events like avalanches kill more people than they harm.  
+
+<br>
+
+
+**Further considerations:**
+
+The question asked of the data is fairly ambiguous in an important way. It is up to interpretation what “most harmful” means in relation to the data. The main part of the analysis assumes cumulative totals is the most useful summary statistic to determine which weather events are most harmful. This result is useful as one can make claims about how harmful certain weather events were over time. However, cumulative totals are heavily weighted by the number of observations for each event in the data. Each observation contributes to the cumulative sum, so the more observations an event has in the data, the greater likelihood it will have a higher number of injuries and deaths.
+
+Another way to determine harmfulness is to look at the relative number of harms per record for each event type. The following code illustrates an example of such a way to look at this summary statistic of the data. In this example, the total number of injuries and fatalities are divided by the number of observations for each event type in the data to yield the variable `harm_per_record`. By comparing harms per the number of observations, one can determine how harmful an event is relative to how rare it is in the data.
+```{r results="asis"}
+#all_injuries_deaths is filtered to remove exceedingly rare events (num_records < 4) and a new variable is added harm_per_record that divides the total number of injuries and deaths by the total number of observations for that event in the data
+rel_inj_deaths <- all_injuries_deaths %>% 
+    filter(num_records > 4) %>% 
+    select(evtype, total_injuries_deaths, num_records) %>% 
+    mutate(harm_per_record = round(total_injuries_deaths/num_records, digits = 2)) %>% 
+    arrange(desc(harm_per_record))
+
+pandoc.table(head(rel_inj_deaths,10), justify = "right")
+```
+
+Some of the expected event types like extreme heat are present in this list. However, tornadoes, for instance, are not present in the top ten of the list. This interesting finding means that even though tornadoes have harmed the most number of people over the years, the amount of harm per tornado is not among the highest per event in the data. An event like a hurricane is much more harmful per event than a tornado even though the cumulative amount of harm by hurricanes is much less than tornadoes.
+
+<br>
+
+**Summary**
+
+<i>Question:</i> Across the United States, which types of events are most harmful with respect to population?
+
+<i>Narrative from the Analysis:</i> The tornado is the most harmful weather event with respect to the population if considering the total number of injuries and deaths due to tornadoes over the years. However, events such as hurricanes are far more harmful relative to their frequency of occurrence. Hurricanes are just much rarer than tornadoes. Any safety professionals using these results will have to determine which measure of harm is most relevant to their concerns.
+
+
+<br>
+
+
+* * *
+
+#### Across the United States, which types of events have the greatest economic consequences?
+
+**Create a summarized table that addresses the question**
+
+The following code creates the data frame, `all_dmg`, which lists each event type by its cumulative total amount of property damage, crop damage, and combined property and crop damage (total damage) in 2011 inflation-adjusted dollars. To make the comparison easier, each category is given a numerical rank for each statistic. By default, the table is sorted by the total amount economic damage in 2011 dollars, but it can be sorted by any of the variables to quickly compare events.
+```{r cache=TRUE, message=FALSE, warning=FALSE, results="asis"}
+#Create a data frame with each event type by cumulative amount of economic damage and give each event a rank
+total_dmg <- dat2 %>% 
+    group_by(evtype) %>% 
+    summarize(`$_tot_dmg` = sum(tot_dmg_dol)) %>% 
+    arrange(desc(`$_tot_dmg`)) %>% 
+    mutate(tot_rank = 1:985)
+
+#Create a data frame with each event type by cumulative amount of property damage and give each event a rank
+prop_dmg <- dat2 %>% 
+    group_by(evtype) %>% 
+    summarize(prop_sum = sum(prop_dmg_dol)) %>% 
+    arrange(desc(prop_sum)) %>% 
+    mutate(prop_rank = 1:985)
+
+#Create a data frame with each event type by cumulative amount of crop damage and give each event a rank
+crop_dmg <- dat2 %>% 
+    group_by(evtype) %>% 
+    summarize(crop_sum = sum(crop_dmg_dol)) %>% 
+    arrange(desc(crop_sum)) %>% 
+    mutate(crop_rank = 1:985)
+
+#Join all three of the data frames together by event type to create the desired table
+all_dmg <- event_dist %>% 
+    left_join(total_dmg) %>% 
+    left_join(prop_dmg) %>% 
+    left_join(crop_dmg) %>%
+    arrange(tot_rank)
+
+pandoc.table(head(all_dmg,10), justify = "right")
+```
+
+From `all_dmg`, it is clear that tornadoes cause the greatest amount of economic damage when accounting for inflation. Tornadoes rank first in both cumulative amount of property damage, and total economic damage. Other events of note are droughts, which cause the greatest amount of crop damage, and hurricane/typhoons, which cause the second highest amount of total economic damage and property damage.
+
+<br>
+
+**Create a plot that visualizes the data**
+
+The following code creates a three-panel plot that shows the top event types for each of economic damages:
+```{r fig.height = 8, fig.width=8, message=FALSE, warning=FALSE}
+##Set numeric print options to display two digits to compress the print size of the y-axis
+options(scipen = 2)
+
+#Create three different top ten lists for the three damages under consideration
+top1 <- all_dmg %>% top_n(n = 10, wt = `$_tot_dmg`) %>% arrange(desc(`$_tot_dmg`))
+top2 <- all_dmg %>% top_n(n = 10, wt = prop_sum) %>% arrange(desc(prop_sum))
+top3 <- all_dmg %>% top_n(n = 10, wt = crop_sum) %>% arrange(desc(crop_sum))
+
+#Create a fourth list that only lists the top eight events for total crop damage to ensure the first of the three plots is correct
+top4 <- all_dmg %>% top_n(n = 7, wt = crop_sum) %>% arrange(desc(crop_sum))
+
+#Join the top ten lists together, substituting top4 for top3 to make sure the list is true to the actual top economic damage list
+plot_dat <- top1 %>% full_join(top2) %>% full_join(top4) %>% gather(sum_type, dol_sum, prop_sum, crop_sum)
+
+#Plot the combined economic damage data using ggplot
+total <- ggplot(plot_dat, aes(x = reorder(evtype, -dol_sum), y = dol_sum, fill = sum_type)) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = rainbow_hcl(2), labels = c("Crop","Property")) +
+    labs(title = "Cumulative Economic Damages by Most Damaging Weather Types in 2011 Dollars",fill = "Damage Type", x="",y = "Total Economic Damages ($)") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position = c(0.92, 0.8), plot.title = element_text(hjust = 0.5)) 
+
+#Plot the property damage data using ggplot
+prop <- ggplot(top2, aes(x = reorder(evtype, -prop_sum), y = prop_sum, fill = "green")) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = rev(rainbow_hcl(2))) +
+    labs(title = "Top 10 Property Damages by Weather Type \n in 2011 Dollars",x = "", y = "Property Damages ($)") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position='none', plot.title = element_text(size=10, hjust = 0.5)) 
+
+#Plot the crop damage data using ggplot
+crop <- ggplot(top3, aes(x = reorder(evtype, -crop_sum), y = crop_sum, fill = "pink")) + 
+    geom_bar(stat="identity") +
+    scale_fill_manual(values = rainbow_hcl(2)) +
+    scale_y_continuous() +
+    labs(title = "Top 10 Crop Damages by Weather Type \n in 2011 Dollars",x="",y = "Crop Damages ($)") +
+    theme(axis.text.x = element_text(angle = 60, hjust = 1), legend.position='none',plot.title = element_text(size=10, hjust = 0.5)) 
+
+#Use gridExtra to create a single panel plot of all three relevant plots for quick comparison
+grid.arrange(total, grid.arrange(prop,crop,ncol=2), ncol = 1)
+```
+The plots visualize the relevant data for this question. The use of bar plots also allows one to see the magnitude of the differences between the cumulative totals for each economic damage type. Again, it is clear that tornadoes have caused the greatest amount of economic damage over the years recorded in the data set. The visualization also shows how more property damage is caused by weather events than crop damage. Many events cause more property damage than crop damage. However, some events like droughts cause more crop damage than property damage. 
+
+<br>
+
+**Further considerations:**
+
+Just like in the previous question, the question asked of the data is fairly ambiguous. It is up to interpretation what “greatest economic consequences” means in relation to the data. The main part of the analysis assumes cumulative amounts are the most useful summary statistic to determine which weather events are most economically damaging. This result is useful as one can make claims about how damaging certain weather events were over time. However, cumulative totals are heavily weighted by the number of observations for each event in the data. Each observation contributes to the cumulative sum, so the more observations an event has in the data, the greater likelihood it will have a higher amount of economic damage.
+
+Another way to determine economic damage is to look at the relative amount of damage in dollars per record for each event type. The following code illustrates an example of such a way to look at this summary statistic of the data. In this example, the total amount of economic damages is divided by the number of observations for each event type in the data to yield the variable `dmg_per_record`. By comparing economic damage per the number of observations, one can determine how economically consequential an event is relative to how rare it is in the data.
+```{r results="asis"}
+options(scipen = 9)
+rel_dmg <- all_dmg %>% 
+    filter(num_records > 4) %>% 
+    select(evtype, `$_tot_dmg`, num_records) %>% 
+    mutate(dmg_per_record = round(`$_tot_dmg`/num_records, digits = 2)) %>% 
+    arrange(desc(dmg_per_record))
+
+pandoc.table(head(rel_dmg,10), justify = "right")
+```
+Many of the same events are present in this list and it is clear that hurricane/typhoons (and their related weather types) are the most economically damaging events by their frequency of occurence. Moreover, just like before, tornadoes are no longer in the top ten as they are relatively common compared to the amount of damage they do. 
+
+<br>
+
+**Summary**
+
+<i>Question:</i> Across the United States, which types of events have the greatest economic consequences?
+
+<i>Narrative from the Analysis:</i> The tornado is the most economically damaging weather event with respect to the population if considering the total amount of property and crop damage due to them over the years. However, hurricanes and their related weather events are more economically damaging relative to their frequency of occurrence than tornadoes. 
+
+
+<br>
+
+**Final concerns with the data**
+
+One major issue with the data that is not corrected in this report is the great similarity between the unique event types present in the data. For instance, "hurricane/typhoon", "hurricane Opal", "hurricane Erin", and "hurricane" are all listed as separate event types. However, all of these event types are likely the same type of weather event, a hurricane. There are many other examples of this overlap in meaning between different event types. This problem was likely caused by an inconsistency in the generality or specificity of categories used while the data was being recorded.
+
+Since the entire analysis groups the data by event type, any change in the number of unique event types could greatly change the order of the analysis results. Thus, if all of the event types were corrected to the same level of generality such as a hurricane event type for all hurricane-related weather events, the analysis conclusions could be different. 
+
+<br>
+
+
+* * *
+
+### Appendix A: Checking the data for outliers and errors
+
+During the processing stage of the data, the data was checked for accuracy considering the largest amounts of harms or economic damage for each weather type. It is important that the data does not contain any large errors as this analysis involves cumulative sums. Cumulative sums are sensitive to large outlier values that can change the ranking of event types if an event has an excessively large value for a single observation. Thus, the top five observations for each summary under consideration (number of injuries, fatalities, and injuries and fatalities, as well as the amount of property damage, crop damage, and combined property and crop damage). Reasonability was determined using general knowledge of weather events as well as quick research of the event type, date, and location to check media records with the NOAA numbers.
+
+First, the top five observations for injuries were reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = injuries) %>% arrange(desc(injuries))
+```
+All of these obeservations seem reasonable as events with large amounts of injuries.
+
+<br>
+
+
+
+Then, the top five observations for fatalities were reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = fatalities) %>% arrange(desc(fatalities))
+```
+All of these obeservations seem reasonable as events with large amounts of fatalities.
+
+<br>
+
+Next, the top five observations for both injuries and fatalities were reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = both_injurys_deaths) %>% arrange(desc(both_injurys_deaths))
+```
+All of these obeservations seem reasonable as events with large amounts of injuries and fatalities.
+
+<br>
+
+After,the top five observations for property damage was reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = prop_dmg_dol) %>% arrange(desc(prop_dmg_dol))
+```
+This check reveals an error in the data. The top property damage event is a flood in California that supposedly caused \$115 billion in damage. The next greatest damage was a storm surge with \$31.3 billion in property damage. Do floods really cause that much damage, nearly four times more than the next most damaging event?
+
+A check of media records confirms the error. The following is an excerpt from a media report on the Napa Valley, CA flood during New Years 2006:
+
+"Damage was estimated at \$100 million in 1986. In today's dollars, that comes to more than \$170 million. Current estimates for this year's flood are in excess of $135 million and climbing, so the two events could produce similar damage figures."
+Writer, Jay Goetting. "Recalling '86 While Cleaning up after '05." Napa Valley Register. Napa Valley Register, 06 Jan. 2006. Web. 31 Mar. 2017.
+
+One could delete this observation, but the numerical portion, 115 is to close to the 135 number reported in the media at the time. The modifier is instead drawn into question as this error could be the simple case of a "B" being substituted for an "M". Thus, \$115 billion becomes \$115 million in the processed data set to correct this error in a reasonable way.
+
+<br>
+
+Also, the top five observations for crop damage was reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = crop_dmg_dol) %>% arrange(desc(crop_dmg_dol))
+```
+All of these obeservations seem reasonable as events with large amounts of crop damage.
+
+<br>
+
+Finally, the top five observations for total damage was reviewed:
+```{r}
+dat1 %>% top_n(n = 5, wt = tot_dmg_dol) %>% arrange(desc(tot_dmg_dol))
+```
+Here the California flood error is again on top of the list, showing how it could have greatly skewed the analysis if left unfixed. Otherwise, all the other entries look reasonable.
