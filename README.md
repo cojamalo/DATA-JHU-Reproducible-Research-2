@@ -45,3 +45,5 @@ In RStudio, make sure your R Markdown document (.𝚁𝚖𝚍) document is loade
 Click the 𝙺𝚗𝚒𝚝 𝙷𝚃𝙼𝙻 button in the doc toolbar to preview your document.
 In the preview window, click the 𝙿𝚞𝚋𝚕𝚒𝚜𝚑 button.
 Once your document is published to RPubs, you should get a unique URL to that document. Make a note of this URL as you will need it to submit your assignment.
+
+Project coded by Connor Lenio - released into the public domain for educational purposes in 2017. 
